@@ -29,226 +29,160 @@ reviewers: []
     - [MachineSetMember API](#machinesetmember-api)
     - [Example](#example)
     - [Resource identity and ownership](#resource-identity-and-ownership)
-    - [Placement compatibility](#placement-compatibility)
+    - [Network identity](#network-identity)
     - [Provisioning and power state](#provisioning-and-power-state)
+    - [Restoring a member's execution](#restoring-a-members-execution)
     - [Compute rollout](#compute-rollout)
     - [Scale-down and deletion](#scale-down-and-deletion)
-    - [Volume updates and encryption](#volume-updates-and-encryption)
-    - [Status and discovery](#status-and-discovery)
+    - [Volumes and encryption](#volumes-and-encryption)
+    - [Status](#status)
+    - [Relation to host fencing](#relation-to-host-fencing)
+- [Security Considerations](#security-considerations)
+- [Testing Strategy](#testing-strategy)
 - [Alternatives](#alternatives)
 
 ## Summary
 
 Introduce `MachineSet` to maintain a requested number of durable VM members from
-one shared template. Each member retains its identity and assigned storage and
-network resources while its underlying `Machine` can be replaced.
+one shared template. Each member retains its identity, disks, and network
+identity while its underlying `Machine` can be replaced.
 
 Users configure `MachineSet`, which coordinates membership and updates.
-A controller-created `MachineSetMember` preserves each member's resource
-associations and progress when its Machine is absent, including when scale-down
-retains its resources for later use. Deleting the set releases its owned members
-and resources. Members are read-only to workload consumers.
+A controller-created `MachineSetMember` records each member's resources and
+progress while its Machine is absent, including after scale-down retains them.
+Deleting the set deletes its members and owned resources and releases external
+ones.
 
 We propose an optional upstream IronCore controller component with associated
 API resources. Packaging and integration decisions are left to maintainers.
 
 ## Motivation
 
-IronCore's `Machine` is a replaceable execution resource. Existing consumers,
-such as Gardener, provide their own lifecycle orchestration.
+IronCore's `Machine` is a replaceable execution resource.
 [IEP-21](https://github.com/ironcore-dev/enhancements/blob/main/ieps/21-machine-eviction.md)
 defines eviction through Machine deletion and leaves recreation to an external
 owner. Direct API consumers currently need to manage this lifecycle themselves.
 
 A long-running VM needs continuity beyond the lifetime of an individual Machine.
 When that Machine is replaced, the workload should retain its root and data
-disks, network identity, and declared configuration.
+disks, its network identity, and its declared configuration.
 
-Users also may need to change a VM's compute size, for example to increase its CPU
-or memory allocation. In IronCore, this means selecting another supported
-MachineClass. Because a Machine's class reference is immutable, applying that
-change requires a replacement Machine that reuses the workload's existing disks
+Users may also need to change a VM's compute size. In IronCore, this means
+selecting another MachineClass. Because a Machine's class reference is
+immutable, this requires a replacement Machine that reuses the workload's disks
 and network identity.
 
 [Issue #65](https://github.com/ironcore-dev/enhancements/issues/65) discusses this
-ownership boundary and a MachineSet abstraction. This proposal covers both a set containing a singleton VM with a persistent root disk and a homogeneous group, such as three broker VMs with the same provisioning configuration but independent disks and
-addresses. A heterogeneous application would use multiple MachineSets;
-coordinating those application components is outside this proposal.
+ownership boundary and a MachineSet abstraction. This proposal covers both a
+singleton VM with a persistent root disk and a homogeneous group, such as three
+broker VMs with the same configuration but independent disks and addresses.
+A heterogeneous application would use multiple MachineSets.
 
 ### Goals
 
-- Maintain a requested number of VM workloads whose configuration and resource
-  associations survive Machine replacement.
+- Maintain a requested number of VM workloads whose configuration, disks, and
+  network identity survive Machine replacement.
 - Provision independent disks and network interfaces for each member from one
   shared template.
-- Allow CPU/RAM sizing changes through sequential Machine replacement, retaining
-  the assigned disks and network identity.
-- Avoid allocating ancillary resources for requested VMs while compute capacity is
-  unavailable, and check suitable capacity before starting planned replacement.
+- Recreate a member's Machine when it has been deleted, including by eviction.
+- Allow CPU/RAM sizing changes through sequential Machine replacement.
 - Make resource retention and deletion explicit during scale-down and when
   deleting MachineSet.
-- Expose each member's current Machine, assigned resources, network addresses,
-  and lifecycle progress through the API.
-- Preserve access to encrypted Volumes across Machine replacement.
-- Define the MachineSet API for future grow-only Volume updates.
+- Expose each member's current Machine, resources, addresses, and progress
+  through the API.
 
 ### Non-Goals
 
 - Live migration, CPU/memory hotplug, or preservation of the Machine UID.
-- Snapshot management, backup/restore, reimaging, disk shrink, or automatic rollback.
+- Snapshots, backup/restore, reimaging, disk resize, or automatic rollback.
 - Application-aware preparation, quiescence, or health checks.
-- Automatic replacement triggered by an unreachable-pool timeout or application
-  health; host fencing and recovery from storage loss.
-- Reserving compute capacity.
+- Detecting host loss or replacing Machines on an unreachable pool. See
+  [Relation to host fencing](#relation-to-host-fencing).
+- Reserving or pre-checking compute capacity.
 - Per-member configuration or heterogeneous sets.
-- Storage or network migration to make an incompatible compute target usable.
-- Owning encryption-key lifecycle management, including rotation, retention,
-  and destruction.
-- Taking over responsibility for Machines already managed by Gardener or other controllers.
+- Preserving the guest-visible MAC address.
+- Managing encryption keys, including rotation and destruction.
+- Taking over Machines already managed by other controllers.
 
 ## Proposal
 
 ### API resources and controllers
 
-Introduce namespaced `MachineSet` and `MachineSetMember` API resources, using
-`compute.ironcore.dev/v1alpha1` as the proposed group and version. This IEP
-defines their API contract and controller responsibilities. API registration, serving, packaging, and integration decisions
-are left open.
-
-MachineSet manages VM lifecycles through IronCore's public resource APIs.
-Provider-specific operations remain with the existing IronCore controllers,
-poollets, and providers.
+Introduce namespaced `MachineSet` and `MachineSetMember` resources in
+`compute.ironcore.dev/v1alpha1`. MachineSet works only through IronCore's public
+resource APIs; placement, provisioning, power, and attachment remain with the
+existing controllers, poollets, and providers.
 
 | Component | Responsibility |
 | --- | --- |
-| MachineSet controller | Membership, shared configuration, provisioning window, rollout order, and aggregate status. |
-| MachineSetMember controller | Durable resource bindings, current execution, operation progress, and safe handoff. |
-| Existing IronCore controllers and providers | Placement, provisioning, power reconciliation, attachment, and provider cleanup. |
+| MachineSet controller | Membership, shared configuration, provisioning and rollout order, aggregate status. |
+| MachineSetMember controller | Durable resource bindings, current Machine, operation progress, and safe handoff between Machines. |
 
-The set selects the work; the member reconciles one logical VM and its retained
-resources. The two reconcilers share the same controller component.
-Field names and examples below are proposed API shapes, not final implementation
-structures.
+Both reconcilers run in one controller component. Field names and examples are
+proposed shapes, not final structures.
 
 ### MachineSet API
 
 | Field | Meaning |
 | --- | --- |
-| `spec.replicas` | Desired member count; non-negative, default `1`. Powered-off members still count. |
-| `spec.template` | Shared Machine template. Supported changes reconcile without another approval step; placement, tolerations, the bootstrap reference, and attachment layout are immutable as specified below. |
+| `spec.replicas` | Desired member count; default `1`. Powered-off members still count. |
+| `spec.template` | Shared Machine template, including `machineClassRef`, `power`, placement, tolerations, `guestConfig`, and attachments. Attachments may use `volumeTemplateRef` and `networkInterfaceTemplateRef`. |
 | `spec.volumeTemplates` | Named templates for standalone per-member Volumes. |
-| `spec.networkInterfaceTemplates` | Named NIC templates instantiated separately for each member |
-| `spec.resourceRetentionPolicy.whenScaledDown` | `Retain` (default) or `Delete` for members outside the desired range. |
-| `spec.volumeUpdatePolicy` | `OnCreate` (default) or `ExpandExisting`; the latter is defined here but initially unsupported. |
+| `spec.networkInterfaceTemplates` | Named templates for per-member NetworkInterfaces. |
+| `spec.resourceRetentionPolicy.whenScaledDown` | `Retain` (default) or `Delete`, applied when a member leaves the desired range. |
 
-The Machine template reuses the applicable Machine fields, including
-`machineClassRef`, `power`, placement selectors, tolerations, and attachments.
-For attachments, it additionally accepts `volumeTemplateRef` and
-`networkInterfaceTemplateRef`. The controller resolves these into concrete
-`volumeRef` and `networkInterfaceRef` values on each child Machine.
+Only `replicas`, `power`, `machineClassRef`, and the retention policy are
+mutable. Everything that defines where a member runs and what it is attached
+to is immutable from creation: placement and tolerations, attachment layout,
+Network, image and bootstrap references, hostname, and template storage
+capacity. Changing `power` updates existing Machines; changing
+`machineClassRef` starts a [compute rollout](#compute-rollout).
 
-Template and attachment names are unique within their lists. Named templates
-use MachineSet-specific validation: `metadata.name` identifies the template,
-not a child resource. Each attachment selects exactly one source. Unknown
-template references, controller-owned claim/binding fields, and conflicting
-member identities are rejected.
+Inputs that are exclusive by nature are accepted only while `replicas` is one,
+including on later scale-up: fixed IPs and prefixes, VirtualIP references, and
+`guestConfig.hostname`. A set that uses them cannot scale beyond one. Without
+`guestConfig.hostname`, the guest hostname is not managed by MachineSet. A
+singleton may also reference externally owned Volumes and NetworkInterfaces.
 
-Unsupported set sizes are rejected before provisioning; limits must not silently
-omit member references or discard retained resources.
+Image and bootstrap (`ignitionRef`) references are fixed, but their content may
+evolve externally. New root Volumes and new Machines use the content available
+when they are created; content changes do not trigger a rollout or reimage
+existing roots, and the guest is not guaranteed to rerun first-boot logic on a
+retained root.
 
-The following MachineSet fields have defined mutability and reconciliation behaviour
-within the controller:
-
-| Field | Mutability | Controller behaviour |
-| --- | --- | --- |
-| `spec.replicas` | Mutable | Provision or deactivate members; apply the scale-down retention policy. |
-| `spec.template.spec.machineClassRef` | Mutable selection | Changing the class name requests a rollout; missing or replaced classes block dependent work. |
-| `spec.template.spec.power` | Mutable | Change the existing Machines' desired power without replacing them. |
-| `spec.resourceRetentionPolicy.whenScaledDown` | Mutable | `Delete` reclaims owned resources of unrequested members, including previously retained ones. `Retain` releases only compute |
-| `spec.volumeTemplates[].spec.resources.storage` | Policy-dependent | Under `OnCreate`, changes affect new Volumes only. The deferred `ExpandExisting` policy grows assigned managed Volumes as described below. |
-| `spec.volumeUpdatePolicy` | Staged support | Initially only `OnCreate` is supported; requests for `ExpandExisting` are rejected until expansion is implemented. |
-| `spec.template.spec.machinePoolSelector`, `spec.template.spec.machinePoolRef` | Immutable | Preserve the user-declared compute placement constraints. |
-| `spec.template.spec.tolerations` | Immutable | Preserve the declared compute-pool tolerations. |
-| `spec.volumeTemplates[].spec.volumePoolSelector`, `spec.volumeTemplates[].spec.volumePoolRef`, `spec.volumeTemplates[].spec.tolerations` | Immutable | Preserve the declared storage placement constraints and tolerations. |
-| `spec.networkInterfaceTemplates[].spec.networkRef` | Immutable | Preserve the selected Network. |
-| `spec.template.spec.ignitionRef` | Immutable reference | The Secret reference and selected key are fixed. New Machines consume the externally managed content available when provisioning is prepared. |
-| `spec.volumeTemplates[].spec.dataSource.osImage.image` | Immutable reference | Used to initialize new root Volumes. The content behind the reference may evolve externally. |
-| `spec.template.spec.volumes`, `spec.template.spec.networkInterfaces` | Immutable | Preserve attachment names, layout, and source references; reject additions, removals, renaming, or retargeting. |
-
-Immutability starts when MachineSet is created, including at zero replicas.
-Supported template fields, source forms, and update behaviour must be explicitly
-defined; underlying schema changes do not imply support. Controller-owned
-claim/binding fields are rejected, but user-declared pool references remain
-valid immutable placement inputs.
-
-A singleton may reference externally owned Volumes and NetworkInterfaces.
-Fixed exclusive inputs, including nested IP/prefix values, fixed Prefix
-allocations, and VirtualIP references, are rejected when `replicas` exceeds
-one, including on later scale-up.
-
-Each member receives its own Volumes and NetworkInterfaces from the templates.
-Members can share the Network, allocation-parent Prefix, classes, image, and Secrets.
-
-Durable roots use standalone Volumes, not Machine-local or Machine-owned
-ephemeral disks. The image reference is fixed, but its publisher may update the
-content behind it. New root Volumes use the image resolved by the provider when
-they are created.
-
-Image-content changes do not trigger a rollout, and replacement Machines reuse
-existing roots without reimaging them. MachineSet neither retains an image
-snapshot nor requires a digest-pinned image.
-
-The bootstrap reference stays fixed, but the Secret's owner may update its
-content, for example to rotate credentials. Each new Machine, including a
-replacement, uses the content available when provisioning is prepared.
-MachineSet keeps no private copy and does not trigger a rollout or reconfigure
-an existing guest when that content changes.
-
-Missing or unreadable input blocks the dependent provisioning or planned
-replacement operation before an existing Machine is stopped. Supplying bootstrap
-input does not guarantee that the guest reruns first-boot logic on a retained
-root disk.
+Durable disks are standalone Volumes: created per member from
+`volumeTemplates`, or, for a singleton, referenced externally. A `localDisk` may
+be used for scratch space; it belongs to one Machine, is created anew for each
+Machine, and does not keep its data across replacement. Ephemeral Volume and
+NetworkInterface sources are rejected, because IronCore deletes them with their
+Machine.
 
 ### MachineSetMember API
 
-A member occupies a zero-based position, or ordinal, within its originating
-MachineSet, identified by that set's UID. An ordinal can be reused after a member
-is permanently reclaimed. The member's own UID distinguishes a retained member
-from a new member later created at that same position.
+A member occupies a zero-based position (its ordinal) within its MachineSet. Its
+own UID distinguishes a retained member from a new member later created at the
+same ordinal. A revision identifies the set's Machine configuration; today only
+a change of `machineClassRef` creates a new revision.
 
 | Field | Meaning |
 | --- | --- |
-| `spec.machineSetRef` | Immutable originating MachineSet name and UID, in the same namespace. |
-| `spec.ordinal` | Immutable logical position. |
-| `spec.lifecycle` | Controller-owned intent: `Active`, `Retained`, or `Reclaiming`; see [Scale-down and deletion](#scale-down-and-deletion). |
-| `spec.targetRevision` | Identity of the applicable execution configuration selected for this member. |
-| `spec.template` | Controller-derived snapshot of the selected execution/resource templates, not a user override. |
-| `status.appliedRevision` | Configuration whose execution has satisfied infrastructure readiness. |
+| `spec.machineSetRef` | Originating MachineSet name and UID. |
+| `spec.ordinal` | Logical position. |
+| `spec.lifecycle` | `Active`, `Retained`, or `Reclaiming`. |
+| `spec.targetRevision` | Configuration selected for this member. |
+| `status.appliedRevision` | Configuration whose Machine reached readiness. |
 | `status.machineRef` | Current Machine name and UID, when present. |
-| `status.volumes`, `status.networkInterfaces` | Named, UID-bound resource associations and observed state. |
-| `status.placement` | Observed compatibility restriction within immutable user placement constraints; does not itself enforce scheduling. |
-| `status.operation` | Operation identity, target revision, phase, and predecessor identity across replacement. |
-| `status.conditions` | Readiness, progress, and blocking information. |
+| `status.volumes`, `status.networkInterfaces` | UID-bound resource references and observed state. |
+| `status.operation` | Current operation, its phase, and the predecessor Machine. |
+| `status.conditions` | Readiness, progress, and blocking reasons. |
 
-A controller restart or failed API/provider call can interrupt replacement
-after the old Machine has gone. The member therefore keeps the selected
-configuration, predecessor identity, and operation progress independently of
-that Machine, so reconciliation can resume without losing the intended change.
-
-The set controller selects and records each operation before the member acts.
-The member's status reports progress; it does not independently authorize
-disruption. One template edit must not start all member replacements at once.
-
-Workload consumers can get, list, and watch members. Creation and mutation of
-member configuration, association labels, lifecycle state, and status are
-reserved for the controllers through RBAC/admission. Unsupported mutations
-must not be accepted and silently overwritten.
+Because the member records its progress independently of the Machine, a
+controller restart in the middle of a replacement is designed to resume without
+losing or duplicating resources. Consumers can read members; only the controller
+can create or modify them. Deleting a `Retained` member is the explicit way to
+reclaim it and its owned resources.
 
 ### Example
-
-This set provisions three independent root Volumes and interfaces. Additional
-named Volume templates provide data disks through the same attachment mechanism.
-Class, image, Network, and parent Prefix names are illustrative existing inputs.
 
 ```yaml
 apiVersion: compute.ironcore.dev/v1alpha1
@@ -297,271 +231,171 @@ spec:
                   prefixLength: 32
                   parentRef:
                     name: application-prefix
+        virtualIP:
+          ephemeral:
+            virtualIPTemplate:
+              spec:
+                type: Public
+                ipFamily: IPv4
+                reclaimPolicy: Delete
   resourceRetentionPolicy:
     whenScaledDown: Retain
-  volumeUpdatePolicy: OnCreate
 ```
+
+Each of the three members gets its own root Volume, NetworkInterface, private
+address, and public VirtualIP, all of which survive replacement of its Machine.
 
 ### Resource identity and ownership
 
-The member records resource names and UIDs, their attachment roles, and whether
-they were created for the member or supplied externally. Generated resources
-carry protected associations with their member UID. Retrying a create must
-recover the same resource, not allocate another bundle.
+The member records the name and UID of every resource it uses, and whether it
+created the resource or it was supplied externally. Creation is idempotent per
+member, so retries never allocate a second set of resources.
 
-Resources belonging to a different owner must not be adopted. Recreating a
-resource or a MachineSet with the same name does not transfer the old binding
-to the new UID. A missing or conflicting binding is reported rather than
-silently replaced with empty storage. Bound Volume and NetworkInterface UIDs
-must be enforced at consumption, including for external resources; name-only
-child references and a prior UID check are insufficient.
+Resources are bound by UID, not by name. Resources of another owner are never
+adopted, and recreating a resource or a MachineSet under the same name does not
+transfer a binding. A missing or conflicting resource is reported as an error,
+never silently replaced with a new, empty one.
 
-MachineSet manages resource bindings, lifecycle, retention, and the selected
-capacity policy. It does not otherwise continually reset existing Volumes or
-NetworkInterfaces to their provisioning templates. Their properties remain
-governed by the underlying APIs and controllers, and MachineSet reports their
-current state.
+Created resources are owned by the member, never by the replaceable Machine.
+They survive Machine replacement and retained scale-down and are cleaned up with
+the set. External and shared resources are released, never deleted.
 
-Generated durable resources may be owned by the member, but not by the
-replaceable Machine. Members belong to the set's lifecycle: they can survive
-Machine replacement or retained scale-down, but are cleaned up on set deletion.
-Finalizers and lifecycle transitions must retire executions and release
-attachments before deleting owned resources and member records. Direct consumer
-deletion of a member is not a scale-down interface.
+### Network identity
 
-### Placement compatibility
+A member's network identity is:
 
-The deployment establishes which compute pools can use each member's complete
-storage and network bundle. These pools form the member's compatible target set.
-MachineSet records that restriction and applies it together with the user's
-immutable placement constraints during provisioning, replacement, and
-reactivation. The actual successor must land within that set; unknown or
-inconsistent membership blocks the start of planned replacement.
+- its private IPs and prefixes;
+- its VirtualIP associations;
+- its Network, and its interface names and their order in the Machine spec;
+- for a singleton, its hostname.
 
-This uses deployment-maintained compatibility, not topology discovery or live
-attachment probing. The integration must enforce compatible placement for
-initial and retained resources; member status alone cannot do so. Unresolved,
-stale, or empty target sets block the operation. Fresh readiness and capacity
-observations are required.
+MachineSet keeps this identity by retaining the member's NetworkInterface and
+attaching it to each successor. Its ephemeral IPs, prefixes, and non-`Retain`
+VirtualIPs are owned by it and come along. Interface names, their order, and
+the hostname come from the template.
 
-A compatible set may contain several MachinePools and may span zones if the
-retained resources are usable there. Neither a MachinePool nor a region/AZ label
-universally establishes resource accessibility, failure-domain independence,
-or data-residency compliance. Different members can have different compatible
-subsets without different user-authored templates.
+VirtualIPs follow their source form:
 
-Lack of compatible capacity causes waiting, not migration or resource
-substitution. External label or taint changes do not relax these constraints;
-existing IronCore eviction remains independent.
+| Source | Accepted | Lifecycle |
+| --- | --- | --- |
+| Ephemeral, `reclaimPolicy: Delete` (or unset) | Any set | Owned by the member's NetworkInterface; kept across replacement, deleted when the member is reclaimed. |
+| Ephemeral, `reclaimPolicy: Retain` | Never | Not owned by the NetworkInterface; no MachineSet lifecycle is defined. |
+| Reference to an existing VirtualIP | Singleton only | Attached and released, never deleted. |
+
+Some properties belong to a particular Machine and are not preserved. The guest
+MAC address is not part of the IronCore API, and how interfaces appear inside the
+guest depends on the provider. Images should not bind network configuration to
+a MAC address.
+
+A successor is created only after the predecessor Machine is fully deleted and
+the NetworkInterface claim is released. Any remaining host-side cleanup is left
+to the networking provider.
 
 ### Provisioning and power state
 
-Provision members in ascending ordinal order, with at most one unfinished
-new-member resource bundle per set. Logical member records can exist before
-allocation. With three of ten members fulfilled, only the fourth may hold
-speculatively allocated disks/NICs; the remaining six stay queued.
+Members are provisioned in ascending ordinal order, one at a time. The next
+member starts when the previous one is ready at its requested power state, so a
+member that cannot be placed holds back later members; set status names the
+member it is waiting on. Reactivating a retained member reuses its resources.
 
-Advance when the member reaches infrastructure readiness at its requested
-power state. A blocked attempt keeps its provisioning slot across retries and
-restarts; the controller must not bypass it by allocating another bundle.
-The bound does not delete previously used resources. Reactivating a retained
-member reuses its bindings. More aggressive provisioning is a future option.
+`power: Off` keeps a member requested but powered off; it is not scale-down and
+does not release resources. A power change updates the existing Machine and
+never replaces it. A shutdown from inside the guest does not change the
+requested power state and does not cause MachineSet to replace the Machine.
 
-`power: Off` means the member remains requested but powered off. It is not
-scale-down and does not make its resources reclaimable. `power: On` delegates
-convergence to the existing power-reconciliation path; guest shutdown does not
-rewrite API intent. A power-only change updates the existing Machine rather
-than replacing it. A compute-class change preserves desired power.
+### Restoring a member's execution
+
+When a requested member's Machine is deleted by someone else, including by
+IEP-21 eviction, MachineSet waits for the deletion to complete and then creates
+a successor Machine with the member's retained disks and network interfaces.
+Successors and newly provisioned members always use the current target
+revision. MachineSet observes the deletion itself; the evicting controller does
+not need to track it. A Machine on an unreachable pool cannot finish deleting,
+so the member keeps waiting. Manually removing that Machine's finalizer bypasses
+this safeguard.
+
+Nothing else causes MachineSet to replace a Machine. In particular, a pool that
+becomes unreachable (`Ready=Unknown`) is reported on the member but does not
+trigger replacement, because it does not show that the predecessor has stopped.
+Power-off, guest shutdown, and scale-down are not failures.
+
+Successors are placed by the existing scheduler within the template's placement
+constraints. These constraints must also express where the member's Volumes and
+network are reachable; MachineSet does not discover this itself. While the
+successor has no pool assigned, for example for lack of capacity, the member
+reports `WaitingForCapacity`, keeps all its resources, and continues once the
+successor is placed. MachineSet does not migrate or substitute resources.
 
 ### Compute rollout
 
-Changing `spec.template.spec.machineClassRef` requests a compute rollout.
-Because a Machine's class reference is immutable, each affected execution is
-replaced while its member and durable resources remain.
+Changing `machineClassRef` replaces members' Machines one at a time, highest
+ordinal first. If any member is already unavailable, the rollout pauses until it
+is available again. For each member:
 
-MachineSet remembers the selected MachineClass name and UID. Observed absence
-or UID change blocks dependent provisioning and planned replacement, with a
-persistent condition and Warning Event. Healthy Machines remain running.
-Recovery requires selecting another `machineClassRef.name`; normal rollout
-gates apply. Reapplying the same name does not authorize a recreated class.
+1. Record the target configuration, and check that the new class and all
+   referenced inputs exist.
+2. Delete the predecessor Machine and wait until its deletion is complete and
+   its attachments are released.
+3. Create the successor with the new class and the retained resources.
+4. Wait for readiness, record the applied configuration, and move on.
 
-Update one member at a time, highest ordinal first. If any requested member is
-already unavailable, do not disrupt another member; recover the unavailable
-members before advancing the rollout. This applies even if the unavailable
-member is not next in ordinal order. Infrastructure readiness at the requested
-power state, not application health, determines completion.
-
-1. Record the target revision and survey the whole rollout's feasibility.
-2. Require fresh positive capacity and compatibility for the next replacement.
-3. Request predecessor shutdown/deletion through the existing lifecycle.
-4. Confirm predecessor teardown and attachment/claim release; keep the Volumes, NetworkInterfaces, and their existing ownership.
-5. Create the successor with the target class and retained resource references.
-6. Observe infrastructure readiness, record the applied revision, and advance.
-
-The initial survey reports unavailable members, outstanding replacements,
-assessable capacity, constraints, and observation freshness. A shortfall or
-incomplete assessment produces a persistent condition and Warning Event, but
-need not block partial progress if the next-member gate passes.
-
-Before every planned replacement, require one free eligible target while the
-predecessor still exists. Check pool readiness, class/hardware support, placement,
-taints/tolerations, committed and in-flight allocations, and retained-resource
-compatibility. Unknown, stale, placeholder, or insufficient capacity does not
-pass. Do not count capacity expected only after deleting the predecessor;
-this can block a same-host resize. Reassess if intervening changes invalidate
-the result, using shared placement/accounting logic rather than probe Machines.
-
-Assessment is not reservation and is performed on a best effort basis: capacity can disappear afterward. Likewise,
-source exclusion requires confirmed teardown, not merely a removed API object,
-claim, or finalizer. No successor may use exclusive resources while the
-predecessor's access remains uncertain.
-
-| Situation | Behaviour |
-| --- | --- |
-| No eligible capacity before shutdown | Keep the predecessor; report blocked and reassess. |
-| Failure after predecessor deletion | Preserve resources; recover the unavailable member before advancing. |
-| Temporary dependency failure | Retry with capped backoff and react to dependency changes. |
-| Unsuitable target configuration | Accept a corrected template; do not require the bad revision to become ready first. |
-| Uncertain teardown or attachment release | Block successor activation; a configuration edit does not bypass exclusion. |
-
-Conflicting actions on a member are serialized. Before shutdown starts, a newer
-request can supersede the planned change. Once teardown starts, confirm
-predecessor exclusion and attachment release before creating a successor using
-the latest desired configuration. If an incompatible successor already exists,
-retire it through the same sequence rather than requiring manual child deletion.
-
-Do not create an execution for a member that is no longer requested or boot one
-whose desired power is Off. Finish irreversible reclamation before provisioning
-a fresh member at the same ordinal.
-
-Retries use capped delays, dependency events, and periodic reassessment without
-churning pending Machines. Desired intent does not expire; a stalled rollout may
-resume days later or remain starved indefinitely. Report last actual progress,
-not merely the latest retry. Reverting compute class requests another rollout,
-not recovery of the old execution or disk contents.
-
-External deletion, including IEP-21 eviction, and terminal execution failure
-leave the member responsible for restoring execution under the same handoff
-rules. Normal power-off is not terminal failure. An unreachable pool is reported
-without timeout-triggered replacement. MachineSet does not wait for guest
-acknowledgement or promise application consistency.
+Replacement keeps the requested power state and involves downtime for that
+member; a rollout takes at most one member out of service at a time. There is no
+capacity check before the predecessor is deleted: if capacity is short
+afterwards, the member waits as described above. A newer class change applies
+to the member in progress, and a successor that has not been placed yet is
+recreated with the latest class, so a bad class change can be corrected.
+MachineSet tracks the MachineClass by UID; if the class is deleted or
+recreated, dependent work stops with a visible reason and running Machines are
+left alone.
 
 ### Scale-down and deletion
 
-Scale down highest ordinals first. The policy applies to members outside the
-desired replica range, not to requested members that happen to be stopped,
-pending, or undergoing replacement.
+Scale-down removes the highest ordinals first.
 
-| Action | Result |
-| --- | --- |
-| Scale down with `Retain` | Remove executions after safe cleanup; retain members and assigned resources. |
-| Scale up a retained ordinal | Reactivate that member using its resources and the current target configuration. |
-| Scale down with `Delete` | Clean up executions, delete member-owned resources, then remove the member. |
-| Change `Retain` to `Delete` | Also reclaim already-retained, unrequested members of this set. |
-| Delete MachineSet | Retire all executions and delete every member and its owned resources, including previously retained members, regardless of scale-down policy. |
+| Action | Result | Member lifecycle |
+| --- | --- | --- |
+| Scale down with `Retain` | Remove the Machine; keep the member and its resources. | `Retained` |
+| Scale up a retained ordinal | Reactivate the member with its resources and the current configuration. | `Active` |
+| Scale down with `Delete` | Remove the Machine, then the member's owned resources and the member. | `Reclaiming` |
+| Delete a `Retained` member | Delete its owned resources, then the member. | `Reclaiming` |
+| Delete the MachineSet | Remove all Machines, members, and owned resources, including retained ones. | `Reclaiming` |
 
-For example, reducing five members to three with `Retain` preserves ordinals
-three and four. A later policy change to `Delete` reclaims their owned bundles
-without another replica change or confirmation.
+The retention policy applies when a member leaves the desired range. Changing
+the policy later does not affect members that are already retained; they are
+reclaimed by deleting them or the set. Scaling to zero with `Retain` releases
+all compute while keeping the durable resources.
 
-To release the whole compute set while preserving its durable resources, scale to zero with
-`Retain`. Deleting the set instead requests permanent cleanup; there is no
-retain-on-set-deletion policy in this proposal.
+Once set deletion begins, no new Machines are created. Deletion always removes
+Machines and releases attachments before deleting resources, and a finalizer
+keeps the set until cleanup is complete.
 
-External resources and shared Networks, classes, images, and key Secrets are
-not deleted by this policy. Deletion of a NIC's owned address-allocation
-resources follows their existing lifecycle; shared infrastructure is untouched.
-Nested ephemeral VIPs with `reclaimPolicy: Retain` are not NIC-owned;
-define their lifecycle before accepting that source form.
+### Volumes and encryption
 
-Once MachineSet deletion begins, stop selecting new provisioning or successor
-creation. Retire executions, establish attachment release, delete member-owned
-resources, and then remove member records before allowing parent removal.
-Previously scaled-down retained members are included in this cleanup. Externally
-supplied resources are released but not deleted.
+Template storage capacity is immutable and applies to new Volumes. Replacement
+keeps each member's existing Volumes as they are. Volume expansion is left to a
+separate proposal.
 
-The deletion finalizer keeps the set present while cleanup is incomplete and
-reports blocking reasons. Members must not restart executions during deletion.
-Keep their identities and references available until their cleanup completes;
-do not use unguarded garbage collection as a substitute for this ordering.
-
-### Volume updates and encryption
-
-**Volume expansion is designed here but deferred from the first implementation.**
-Disk capacity is separate from MachineClass; compute replacement preserves
-assigned disks and their sizes.
-
-| Policy | Behaviour |
-| --- | --- |
-| `OnCreate` | Use the template's requested capacity when creating a Volume. Later capacity edits affect new Volumes only, not assigned ones. |
-| `ExpandExisting` | Propagate increased template capacity to managed Volumes of requested members without replacing them. Initially reject this policy as unsupported. |
-
-The future `ExpandExisting` behaviour is:
-
-- Grow managed Volumes of requested members, including powered-off members.
-  Evaluate inactive retained members on reactivation; external Volumes remain
-  separately managed.
-- Treat requested capacity as a minimum, retain larger existing disks, and
-  reject decreases to an already requested expansion target. Grow the same
-  Volume without migration or replacement.
-- On explicit selection, evaluate current template capacities against assigned
-  Volumes. Controller upgrades must neither change the default nor silently
-  activate previously ignored requests.
-- Returning to `OnCreate` stops forwarding new capacity edits, but submitted
-  expansion requests continue and their progress remains visible.
-
-Per-volume status records `requestedCapacity`, `observedCapacity` (backing size),
-`attachmentCapacity`, and expansion conditions. Report backing and attachment
-completion separately: absent attachment is not applicable yet; unobservable
-capacity is unknown, including under `OnCreate`. Do not infer observed size from
-the request. A later attachment must reflect the grown disk; guest filesystem
-expansion remains external. Failed growth retains the disk, reports its stage,
-and follows normal retry rules. Compute/storage edits are not an atomic rollback.
-
-**Rotation compatibility is required; rotation ownership remains external.**
-MachineSet uses the encryption configuration and status exposed by the Volume API
-to support encrypted-volume replacement. API support needed for this
-interoperability is in scope; responsibility for key lifecycle operations remains
-with the Volume/storage layer and external key-management systems. This does not
-introduce a separate MachineSet key-rotation API.
-
-The operator or key-management system requests rotation and owns key-retention
-policy; the Volume/poollet/provider layer rotates keys and resolves effective
-attachment credentials. MachineSet preserves bindings, does not overwrite
-rotation intent with provisioning defaults, and blocks handoff when safe
-attachment cannot be established.
-
-This depends on the shared attachment behaviour addressed by the
+MachineSet attaches encrypted Volumes like any other and leaves key management
+to the Volume and storage layer, including the
 [Volume encryption-key rotation design](https://github.com/ironcore-dev/enhancements/pull/62).
-A stale status reference alone is not sufficient. MachineSet does not copy raw
-keys, destroy key Secrets, or use rotation as predecessor fencing.
+MachineSet stores no keys or key references in member state and never changes a
+Volume's encryption configuration. An encryption Secret named in a Volume
+template is passed to every member's Volume, so members share it; MachineSet
+never reads it.
 
-### Status and discovery
+### Status
 
-MachineSet status contains aggregate observations and compact member references:
+MachineSet status reports `readyReplicas`, `updatedReplicas`, `pendingReplicas`,
+the target configuration, the last progress time, `Ready` and `Progressing`
+conditions, and a compact list of members with their ordinal, UID, and current
+operation phase. Details stay on each member, and members can be listed directly
+by the set's UID.
 
-| Field | Meaning |
-| --- | --- |
-| `observedGeneration` | Set generation observed by its controller. |
-| `readyReplicas`, `updatedReplicas`, `pendingReplicas` | Requested members meeting infrastructure readiness, target revision, or awaiting fulfillment, respectively. |
-| `targetRevision`, `lastProgressTime` | Current configuration identity and last substantive progress. |
-| `activeOperations` | Bounded provisioning/replacement operation identities, selected member references, and target revisions, owned by the set controller. |
-| `conditions` | Readiness, rollout progress, capacity assessment, and blocking reasons. |
-| `members` | Recorded members, including retained unrequested ones: ordinal plus Member name/UID; not duplicated resource inventories. |
-
-`updatedReplicas` compares applied execution revisions with the set's current
-target, independently of present readiness. Changing Volume-template capacity
-under `OnCreate` does not make an existing execution outdated; resource bindings
-and capacities are separate observations. No independent provisioning-revision
-API is required.
-
-Conditions such as `Ready`, `Progressing`, and `CapacityAvailable` use standard
-fields and distinguish `False` from `Unknown`. Eight ready and four updated
-members is a valid stalled-rollout state. Ready reflects observed infrastructure
-health at the requested power state; target revision is reported separately.
-It is not a copy of Machine Ready and does not establish application health.
-
-A member status excerpt illustrates resource navigation:
+Member status reports the current Machine, each resource with its UID and
+observed state (including addresses and Volume capacity), and conditions. The
+reason `PoolUnreachable` means the current Machine's pool is `Ready=Unknown`;
+`WaitingForCapacity` means a new Machine has no pool assigned yet.
 
 ```yaml
 status:
@@ -583,48 +417,88 @@ status:
         uid: "<interface-uid>"
       ips:
         - "10.0.0.23"
+      virtualIP: "203.0.113.23"
 ```
 
-These example names are illustrative, not a name-derivation interface. Member
-references survive Machine replacement. Include any associated VirtualIP
-reference and observed address when present. References distinguish managed
-from external resources and include namespace where required.
+### Relation to host fencing
 
-Clients can list a MachineSet's members directly using its UID and namespace,
-without first retrieving the MachineSet. The result includes requested members
-and members retained after scale-down, with their resource references and
-observed state.
+Recovering a member after host loss needs a fencing mechanism, which IronCore
+does not have today and this proposal does not define. If IronCore gains a
+signal that a Machine is safely stopped, MachineSet may use it as an additional
+trigger for creating a successor; that interface belongs to that future work.
+
+## Security Considerations
+
+- **Access.** Users manage MachineSets in their namespace. MachineSetMembers are
+  written only by the controller; users can read them and delete a `Retained`
+  member to reclaim it.
+- **Acting for the user.** All references are namespace-local. Permission to
+  create MachineSets effectively grants creation of Machines, Volumes,
+  NetworkInterfaces, and public VirtualIPs in that namespace, so grant it
+  accordingly. Existing quotas apply to everything the controller creates.
+- **Ownership.** Another owner's resources are never adopted, and external or
+  shared resources are never deleted.
+- **One Machine per member.** MachineSet never creates a second Machine for a
+  member while the previous one exists, and an unreachable pool alone never
+  authorises a successor. Machines reference Volumes and NetworkInterfaces by
+  name; after creating a successor, MachineSet checks that the resources it
+  claimed carry the bound UIDs and deletes the successor on a mismatch.
+  Teardown on the host is left to the existing poollets and providers. Removing
+  a Machine's finalizer by hand voids this guarantee.
+- **Exclusive inputs.** Fixed IPs, VirtualIP references, and hostnames are
+  limited to singletons, so a template cannot hand the same address or name to
+  several members.
+- **Secrets.** Member state contains no keys, credentials, or Secret content.
+
+## Testing Strategy
+
+- **Unit and envtest:** template validation and immutability, UID binding and
+  conflict handling, idempotent creation across controller restarts, retention
+  policy, and status.
+- **End to end** (IronCore e2e suite): on a multi-host environment with
+  network-attached Volumes and IronCore networking: provisioning, power changes,
+  scale-down and reactivation, set deletion, replacement after deletion and
+  eviction, capacity shortage, and class rollout. After each replacement, check
+  that disks, IPs, prefixes, VirtualIPs, and interface order are unchanged. An
+  unreachable or offline pool never triggers replacement.
+- **Fault injection:** controller interruption at each step, concurrent edits,
+  and conflicting resources. Each test asserts that a member never has two
+  Machines and that no resource is duplicated or deleted early.
 
 ## Alternatives
 
 ### External orchestration only
 
-Existing APIs allow consumers to implement resource retention and sequential
-replacement themselves. This preserves the current responsibility boundary,
-but repeats IronCore-specific lifecycle and failure handling in each consumer.
-MachineSet offers a common lifecycle without changing existing consumers.
+Consumers can already implement retention and sequential replacement
+themselves, but each would repeat the same IronCore-specific lifecycle and
+failure handling. MachineSet offers a common implementation without changing
+existing consumers.
 
 ### StatefulSet-style bookkeeping without MachineSetMember
 
-Kubernetes StatefulSet reconstructs logical slots from the set, Pods, PVCs, and
-revision history. It demonstrates that ordinals, retained disks, and ordered
-replacement do not require a separate member API.
-
-Our retained bundle also records independent network resources, owned versus
-external references, resource UIDs, and cross-execution progress. That inventory
-must remain discoverable while a Machine is absent and after retained scale-down,
-including scale-to-zero, until the member is reactivated or reclaimed.
-
-Without a member API, equivalent retained inventory and progress tracking would
-need to be maintained through set status and protected resource metadata.
-
-We prefer one typed, controller-owned member record. This adds an API lifecycle,
-RBAC, and garbage-collection obligations; it does not itself solve fencing,
-rollback, or scalability. It is a representation trade-off, not a claim that
-the StatefulSet pattern cannot be extended.
+A StatefulSet reconstructs its slots from the set, Pods, PVCs, and revision
+history. Our members must also record network resources, owned versus external
+references, UIDs, and progress while no Machine exists, including after scale
+to zero. A typed member record keeps that discoverable at the cost of an extra
+API. It is a representation trade-off, not a claim that the StatefulSet pattern
+cannot be extended.
 
 ### Durable Machine identity
 
-Keeping the Machine while changing its realization or placement would change
-the existing immutable-placement and eviction model. A parent/member lifecycle
-keeps Machine replaceable and leaves existing provider consumers unchanged.
+Keeping one Machine and changing its placement or size would change IronCore's
+immutable-placement and eviction model. A set/member lifecycle keeps Machine
+replaceable and leaves providers unchanged.
+
+### Replacement on pool health timeout
+
+MachineSet could replace Machines on a pool that stays unreachable for some
+time. Unreachable does not mean stopped, so this could run two copies of a
+member against the same disks. MachineSet therefore does not replace Machines on
+unreachable pools; recovery after host loss is out of scope (see
+[Relation to host fencing](#relation-to-host-fencing)).
+
+### Capacity check before replacement
+
+MachineSet could require free capacity before deleting a predecessor. A check
+is not a reservation and would duplicate scheduler logic, so this proposal
+reports `WaitingForCapacity` instead and keeps all resources.
